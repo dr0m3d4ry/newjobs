@@ -212,16 +212,11 @@ def print_rows(rows: list[sqlite3.Row]) -> None:
         if i:
             print()
         print(f"  {r['pk']:>4}  {r['title']}")
-        parts = []
-        if r["company"]:
-            parts.append(f"[{r['company']}]")
-        if r["location"]:
-            parts.append(r["location"])
-        seen_day = (r["first_seen"] or "")[:10]
-        if seen_day:
-            parts.append(seen_day)
-        if parts:
-            print(f"        {'   '.join(parts)}")
+        meta = "  ".join(
+            x for x in (r["company"], r["location"], (r["first_seen"] or "")[:10]) if x
+        )
+        if meta:
+            print(f"        {meta}")
         if r["url"]:
             print(f"        {r['url']}")
 
@@ -313,7 +308,7 @@ def _match_title(title: str, keywords: list[str]) -> bool:
 
 
 def cmd_run(con: sqlite3.Connection, sources: list[dict], delay: float,
-            title_filter: list[str] | None = None) -> None:
+            title_filter: list[str] | None = None) -> list[sqlite3.Row]:
     total_new = 0
     all_new: list[sqlite3.Row] = []
     for i, cfg in enumerate(sources):
@@ -341,13 +336,14 @@ def cmd_run(con: sqlite3.Connection, sources: list[dict], delay: float,
         else:
             print(f"  {name}: {len(jobs)} listings, {len(new_rows)} new")
     print(f"\n{total_new} new posting(s).")
+    return all_new
     if all_new:
         print()
         print_rows(all_new)
 
 
 def cmd_watch(con: sqlite3.Connection, config_path: str, interval: int, delay: float,
-               title_filter: list[str] | None = None) -> None:
+               title_filter: list[str] | None = None, csv_path: str | None = None) -> None:
     print(f"watching every {interval}s (re-reads {config_path} each cycle). ctrl-c to stop.")
     sources: list[dict] = []
     try:
@@ -361,7 +357,10 @@ def cmd_watch(con: sqlite3.Connection, config_path: str, interval: int, delay: f
                 print(f"  ! {config_path} is not valid JSON ({exc}); using last good list",
                       file=sys.stderr)
             print(f"\n[{datetime.now():%Y-%m-%d %H:%M}] {len(sources)} source(s), polling...")
-            cmd_run(con, sources, delay, title_filter)
+            new = cmd_run(con, sources, delay, title_filter)
+            if new and csv_path:  # accumulate: write all unseen so the csv holds the night's finds
+                n = write_csv(unseen(con), csv_path)
+                print(f"  wrote {n} unseen posting(s) to {csv_path}")
             time.sleep(interval)
     except KeyboardInterrupt:
         print("\nstopped.")
@@ -380,13 +379,9 @@ def cmd_review(con: sqlite3.Connection) -> None:
         _clear_screen()
         print(f"[ {i + 1} / {n} ]\n")
         print(f"  {r['title']}")
-        parts = []
-        if r["company"]:
-            parts.append(f"[{r['company']}]")
-        if r["location"]:
-            parts.append(r["location"])
-        if parts:
-            print(f"  {'   '.join(parts)}")
+        meta = "  ".join(x for x in (r["company"], r["location"]) if x)
+        if meta:
+            print(f"  {meta}")
         if r["url"]:
             print(f"  {r['url']}")
         print("\n  [d]/space = seen (dismiss)   [o]pen   [s]kip   [b]ack   [q]uit")
@@ -472,16 +467,9 @@ def cmd_test(ats: str, slug: str) -> None:
         print("\n  0 postings. platform/slug may be wrong, or no open roles right now.")
 
 
-def cmd_export(con: sqlite3.Connection, out_path: str, include_all: bool) -> None:
-    """write postings to CSV with every stored field. unseen only unless --all."""
+def write_csv(rows: list[sqlite3.Row], out_path: str) -> int:
+    """write the given rows to CSV with every stored field. overwrites out_path."""
     import csv
-    where = "" if include_all else " WHERE status='new'"
-    rows = con.execute(
-        "SELECT * FROM jobs" + where + " ORDER BY first_seen DESC, pk DESC"
-    ).fetchall()
-    if not rows:
-        print("nothing to export." if include_all else "nothing new to export (try --all).")
-        return
 
     # meta columns first, then every field found in any record's stored data
     fields = ["source", "status", "first_seen"]
@@ -512,7 +500,20 @@ def cmd_export(con: sqlite3.Connection, out_path: str, include_all: bool) -> Non
         w.writeheader()
         for rec in records:
             w.writerow({k: flat(v) for k, v in rec.items()})
-    print(f"exported {len(records)} posting(s) to {out_path} ({len(fields)} columns).")
+    return len(records)
+
+
+def cmd_export(con: sqlite3.Connection, out_path: str, include_all: bool) -> None:
+    """write postings to CSV with every stored field. unseen only unless --all."""
+    where = "" if include_all else " WHERE status='new'"
+    rows = con.execute(
+        "SELECT * FROM jobs" + where + " ORDER BY first_seen DESC, pk DESC"
+    ).fetchall()
+    if not rows:
+        print("nothing to export." if include_all else "nothing new to export (try --all).")
+        return
+    n = write_csv(rows, out_path)
+    print(f"exported {n} posting(s) to {out_path}.")
 
 
 def cmd_platforms() -> None:
@@ -572,11 +573,13 @@ def build_parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("run", help="poll all sources once")
     pr.add_argument("--delay", type=float, default=8.0, help="seconds between sources")
     pr.add_argument("--title", help="only keep postings whose title contains any of these (comma-separated)")
+    pr.add_argument("--csv", default="jobs_export.csv", help="write this run's new postings to this CSV")
 
     pw = sub.add_parser("watch", help="poll on a loop")
     pw.add_argument("-i", "--interval", type=int, default=3600, help="seconds between polls")
     pw.add_argument("--delay", type=float, default=8.0, help="seconds between sources")
     pw.add_argument("--title", help="only keep postings whose title contains any of these (comma-separated)")
+    pw.add_argument("--csv", default="jobs_export.csv", help="accumulate new postings into this CSV each cycle")
 
     sub.add_parser("list", help="show unseen postings")
     sub.add_parser("review", help="step through unseen postings, one key to dismiss")
@@ -631,9 +634,12 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "title", None):
         title_filter = [w.strip().lower() for w in args.title.split(",") if w.strip()]
     if args.cmd == "run":
-        cmd_run(con, load_sources(args.config), args.delay, title_filter)
+        new = cmd_run(con, load_sources(args.config), args.delay, title_filter)
+        if new:  # overwrite: the csv holds just this run's new postings
+            n = write_csv(new, args.csv)
+            print(f"  wrote {n} new posting(s) to {args.csv}")
     elif args.cmd == "watch":
-        cmd_watch(con, args.config, args.interval, args.delay, title_filter)
+        cmd_watch(con, args.config, args.interval, args.delay, title_filter, args.csv)
     elif args.cmd == "list":
         print_unseen(unseen(con))
     elif args.cmd == "review":
