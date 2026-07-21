@@ -111,6 +111,9 @@ def fetch_jobhive(cfg: dict) -> list[Job]:
         url = _field(rec, "url", "apply_url")
         if not title and not url:
             continue  # skip empty ghost records (no title and no link)
+        company = _field(rec, "company")
+        if not company or "." in company or "/" in company:
+            company = cfg["name"]  # feed gave a url/domain (or nothing); use the source name
         # stable id, never blank
         gid = _field(rec, "global_id")
         rid = _field(rec, "ats_id", "id", "requisition_id")
@@ -127,7 +130,7 @@ def fetch_jobhive(cfg: dict) -> list[Job]:
                 source=cfg["name"],
                 external_id=ext,
                 title=title,
-                company=_field(rec, "company") or slug,
+                company=company,
                 location=_field(rec, "location"),
                 url=url,
                 data=rec,
@@ -391,7 +394,7 @@ def cmd_watch(con: sqlite3.Connection, config_path: str, interval: int, delay: f
             log_errors(failed)
             if new and csv_path:  # accumulate: write all unseen so the csv holds the night's finds
                 n = write_csv(unseen(con), csv_path)
-                print(f"  wrote {n} unseen posting(s) to {csv_path}")
+                print(f"\n  wrote {n} unseen posting(s) to {csv_path}")
             # count consecutive failures per source; reset any that worked this cycle
             failed_names = {name for name, _ in failed}
             for cfg in sources:
@@ -686,7 +689,7 @@ def main(argv: list[str] | None = None) -> int:
         log_errors(failed)
         if new:  # overwrite: the csv holds just this run's new postings
             n = write_csv(new, args.csv)
-            print(f"  wrote {n} new posting(s) to {args.csv}")
+            print(f"\n  wrote {n} new posting(s) to {args.csv}")
     elif args.cmd == "watch":
         cmd_watch(con, args.config, args.interval, args.delay, title_filter, args.csv)
     elif args.cmd == "list":
