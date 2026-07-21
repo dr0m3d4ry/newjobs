@@ -5,9 +5,11 @@ jobs.db-wal
 jobs.db-shm
 test.json
 test.db
+*.csv
 
 # python
 __pycache__/
 *.pyc
 .venv/
 venv/
+

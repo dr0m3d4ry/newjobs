@@ -34,7 +34,7 @@ import sqlite3
 import sys
 import time
 import webbrowser
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -50,11 +50,38 @@ class Job:
     company: str = ""
     location: str = ""
     url: str = ""
+    data: dict = field(default_factory=dict)  # full record from jobhive
 
 
 # --------------------------------------------------------------------------- #
 # fetching via jobhive (kalil0321/ats-scrapers)
 # --------------------------------------------------------------------------- #
+def _to_dict(record: object) -> dict:
+    """the whole record as a plain dict (pydantic, object, or dict)."""
+    if isinstance(record, dict):
+        return dict(record)
+    for meth in ("model_dump", "dict"):
+        fn = getattr(record, meth, None)
+        if callable(fn):
+            try:
+                d = fn()
+                if isinstance(d, dict):
+                    return d
+            except Exception:
+                pass
+    d = getattr(record, "__dict__", None)
+    if isinstance(d, dict) and d:
+        return dict(d)
+    out = {}
+    for k in dir(record):
+        if k.startswith("_"):
+            continue
+        v = getattr(record, k, None)
+        if not callable(v):
+            out[k] = v
+    return out
+
+
 def _field(record: object, *names: str) -> str:
     """first non-empty field by name; handles object attrs or dict keys."""
     for n in names:
@@ -79,11 +106,12 @@ def fetch_jobhive(cfg: dict) -> list[Job]:
     ats, slug = cfg["ats"], cfg["slug"]
     out: list[Job] = []
     for j in get_scraper(ats, slug).fetch():
-        title = _field(j, "title")
-        url = _field(j, "url", "apply_url")
+        rec = _to_dict(j)  # keep everything jobhive returns
+        title = _field(rec, "title")
+        url = _field(rec, "url", "apply_url")
         # stable id, never blank
-        gid = _field(j, "global_id")
-        rid = _field(j, "ats_id", "id", "requisition_id")
+        gid = _field(rec, "global_id")
+        rid = _field(rec, "ats_id", "id", "requisition_id")
         if gid:
             ext = gid
         elif rid:
@@ -97,9 +125,10 @@ def fetch_jobhive(cfg: dict) -> list[Job]:
                 source=cfg["name"],
                 external_id=ext,
                 title=title,
-                company=_field(j, "company") or slug,
-                location=_field(j, "location"),
+                company=_field(rec, "company") or slug,
+                location=_field(rec, "location"),
                 url=url,
+                data=rec,
             )
         )
     return out
@@ -120,6 +149,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     company     TEXT,
     location    TEXT,
     url         TEXT,
+    data        TEXT,
     first_seen  TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'new',
     UNIQUE(source, external_id)
@@ -145,9 +175,10 @@ def upsert_jobs(con: sqlite3.Connection, jobs: list[Job]) -> list[sqlite3.Row]:
     for j in jobs:
         cur = con.execute(
             "INSERT OR IGNORE INTO jobs"
-            "(source, external_id, title, company, location, url, first_seen) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (j.source, j.external_id, j.title, j.company, j.location, j.url, now),
+            "(source, external_id, title, company, location, url, data, first_seen) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (j.source, j.external_id, j.title, j.company, j.location, j.url,
+             json.dumps(j.data, default=str), now),
         )
         if cur.rowcount:
             new_rows.append(
@@ -432,6 +463,49 @@ def cmd_test(ats: str, slug: str) -> None:
         print("\n  0 postings. platform/slug may be wrong, or no open roles right now.")
 
 
+def cmd_export(con: sqlite3.Connection, out_path: str, include_all: bool) -> None:
+    """write postings to CSV with every stored field. unseen only unless --all."""
+    import csv
+    where = "" if include_all else " WHERE status='new'"
+    rows = con.execute(
+        "SELECT * FROM jobs" + where + " ORDER BY first_seen DESC, pk DESC"
+    ).fetchall()
+    if not rows:
+        print("nothing to export." if include_all else "nothing new to export (try --all).")
+        return
+
+    # meta columns first, then every field found in any record's stored data
+    fields = ["source", "status", "first_seen"]
+    seen = set(fields)
+    records = []
+    for r in rows:
+        try:
+            d = json.loads(r["data"]) if r["data"] else {}
+        except Exception:
+            d = {}
+        if not isinstance(d, dict):
+            d = {}
+        rec = {"source": r["source"], "status": r["status"], "first_seen": r["first_seen"]}
+        rec.update(d)
+        records.append(rec)
+        for k in d:
+            if k not in seen:
+                seen.add(k)
+                fields.append(k)
+
+    def flat(v):
+        if v is None or isinstance(v, (str, int, float, bool)):
+            return v
+        return json.dumps(v, default=str)  # nested things (raw, lists) -> JSON text
+
+    with open(out_path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=fields, restval="", extrasaction="ignore")
+        w.writeheader()
+        for rec in records:
+            w.writerow({k: flat(v) for k, v in rec.items()})
+    print(f"exported {len(records)} posting(s) to {out_path} ({len(fields)} columns).")
+
+
 def cmd_platforms() -> None:
     """print the ats names jobhive currently supports (fetched live)."""
     import urllib.request
@@ -513,6 +587,9 @@ def build_parser() -> argparse.ArgumentParser:
     pt = sub.add_parser("test", help="fetch one company by ats+slug without adding it")
     pt.add_argument("ats", help="platform, e.g. greenhouse")
     pt.add_argument("slug", help="company slug on that ATS")
+    pe = sub.add_parser("export", help="export postings to CSV (unseen only unless --all)")
+    pe.add_argument("--all", action="store_true", help="include seen/dismissed too")
+    pe.add_argument("-o", "--out", default="jobs_export.csv", help="output CSV path")
     sub.add_parser("platforms", help="list ATS platforms jobhive supports")
 
     return p
@@ -554,6 +631,8 @@ def main(argv: list[str] | None = None) -> int:
         cmd_review(con)
     elif args.cmd == "seen":
         cmd_seen(con, args.ids)
+    elif args.cmd == "export":
+        cmd_export(con, args.out, args.all)
     con.close()
     return 0
 
