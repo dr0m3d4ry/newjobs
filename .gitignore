@@ -1,0 +1,13 @@
+# local data - not committed
+sources.json
+jobs.db
+jobs.db-wal
+jobs.db-shm
+test.json
+test.db
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/

@@ -1,0 +1,72 @@
+[
+  {
+    "_comment": "TEMPLATE (reference only) - do not point the script at this file. Copy blocks into sources.json, delete the ones you don't use. Every entry has type 'jobhive'; only 'ats' and 'slug' change. Run 'python job_watcher.py platforms' for the full platform list. Keep each 'name' unique.",
+    "name": "IGNORE THIS FIRST ENTRY",
+    "type": "jobhive",
+    "ats": "greenhouse",
+    "slug": "placeholder"
+  },
+  {
+    "_comment": "GREENHOUSE - slug is the token in boards.greenhouse.io/<slug>",
+    "name": "Example (Greenhouse)",
+    "type": "jobhive",
+    "ats": "greenhouse",
+    "slug": "examplecompany"
+  },
+  {
+    "_comment": "LEVER - slug from jobs.lever.co/<slug>",
+    "name": "Example (Lever)",
+    "type": "jobhive",
+    "ats": "lever",
+    "slug": "examplecompany"
+  },
+  {
+    "_comment": "ASHBY - slug from jobs.ashbyhq.com/<slug>",
+    "name": "Example (Ashby)",
+    "type": "jobhive",
+    "ats": "ashby",
+    "slug": "examplecompany"
+  },
+  {
+    "_comment": "SMARTRECRUITERS - slug from jobs.smartrecruiters.com/<Company> (case-sensitive)",
+    "name": "Example (SmartRecruiters)",
+    "type": "jobhive",
+    "ats": "smartrecruiters",
+    "slug": "ExampleCompany"
+  },
+  {
+    "_comment": "WORKDAY - slug is usually the tenant (the subdomain before .wdN.myworkdayjobs.com). If a company won't resolve, its site name may also be needed; confirm per company.",
+    "name": "Example (Workday)",
+    "type": "jobhive",
+    "ats": "workday",
+    "slug": "examplecompany"
+  },
+  {
+    "_comment": "SUCCESSFACTORS - slug identifies the company's SF career site; confirm per company",
+    "name": "Example (SuccessFactors)",
+    "type": "jobhive",
+    "ats": "successfactors",
+    "slug": "examplecompany"
+  },
+  {
+    "_comment": "PHENOM - powers many careers.<company>.com sites. slug identifies the Phenom site; confirm per company",
+    "name": "Example (Phenom)",
+    "type": "jobhive",
+    "ats": "phenom",
+    "slug": "examplecompany"
+  },
+  {
+    "_comment": "ICIMS - slug identifies the iCIMS customer/portal; confirm per company",
+    "name": "Example (iCIMS)",
+    "type": "jobhive",
+    "ats": "icims",
+    "slug": "examplecompany"
+  },
+  {
+    "_comment": "OTHER - jobhive supports ~47 platforms (Oracle, Taleo, Workable, Recruitee, BambooHR, Eightfold, Avature, JazzHR, ...). Run 'python job_watcher.py platforms' and use the same shape: set 'ats' and 'slug'.",
+    "name": "Example (any other ATS)",
+    "type": "jobhive",
+    "ats": "workable",
+    "slug": "examplecompany"
+  }
+]
