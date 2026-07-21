@@ -107,10 +107,10 @@ def fetch_jobhive(cfg: dict) -> list[Job]:
     out: list[Job] = []
     for j in get_scraper(ats, slug).fetch():
         rec = _to_dict(j)  # keep everything jobhive returns
-        title = _field(rec, "title")
+        title = _field(rec, "title").strip()
         url = _field(rec, "url", "apply_url")
-        if not title:
-            continue  # skip records with no title (junk, even if a base url is present)
+        if not title or title.lower() == "untitled":
+            continue  # skip junk records: blank title, or jobhive's "Untitled" parse-failure marker
         company = _field(rec, "company")
         if not company or "." in company or "/" in company:
             company = cfg["name"]  # feed gave a url/domain (or nothing); use the source name
