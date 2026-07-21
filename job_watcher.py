@@ -212,11 +212,16 @@ def print_rows(rows: list[sqlite3.Row]) -> None:
         if i:
             print()
         print(f"  {r['pk']:>4}  {r['title']}")
-        meta = "  ".join(
-            x for x in (r["company"], r["location"], (r["first_seen"] or "")[:10]) if x
-        )
-        if meta:
-            print(f"        {meta}")
+        parts = []
+        if r["company"]:
+            parts.append(f"[{r['company']}]")
+        if r["location"]:
+            parts.append(r["location"])
+        seen_day = (r["first_seen"] or "")[:10]
+        if seen_day:
+            parts.append(seen_day)
+        if parts:
+            print(f"        {'   '.join(parts)}")
         if r["url"]:
             print(f"        {r['url']}")
 
@@ -307,22 +312,44 @@ def _match_title(title: str, keywords: list[str]) -> bool:
     return any(k in t for k in keywords)
 
 
+ERROR_LOG = "errors.log"
+FAIL_ALERT_THRESHOLD = 3
+
+
+def log_errors(failures: list[tuple[str, str]]) -> None:
+    """append source failures to the error log, timestamped."""
+    if not failures:
+        return
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        with open(ERROR_LOG, "a", encoding="utf-8") as fh:
+            for name, reason in failures:
+                fh.write(f"{ts}\t{name}\t{reason}\n")
+    except OSError:
+        pass
+
+
 def cmd_run(con: sqlite3.Connection, sources: list[dict], delay: float,
-            title_filter: list[str] | None = None) -> list[sqlite3.Row]:
+            title_filter: list[str] | None = None) -> tuple[list[sqlite3.Row], list[tuple[str, str]]]:
     total_new = 0
     all_new: list[sqlite3.Row] = []
+    failed: list[tuple[str, str]] = []
     for i, cfg in enumerate(sources):
         name = cfg.get("name", "?")
         fetch = FETCHERS.get(cfg.get("type", ""))
         if fetch is None:
-            print(f"  ! {name}: unknown type {cfg.get('type')!r}", file=sys.stderr)
+            reason = f"unknown type {cfg.get('type')!r}"
+            print(f"  ! {name}: {reason}", file=sys.stderr)
+            failed.append((name, reason))
             continue
         if i:  # gap between sources
             time.sleep(delay)
         try:
             jobs = fetch(cfg)
         except Exception as exc:  # a bad source never kills the run
-            print(f"  ! {name}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            reason = f"{type(exc).__name__}: {exc}"
+            print(f"  ! {name}: {reason}", file=sys.stderr)
+            failed.append((name, reason))
             continue
         if title_filter:
             kept = [j for j in jobs if _match_title(j.title, title_filter)]
@@ -336,16 +363,17 @@ def cmd_run(con: sqlite3.Connection, sources: list[dict], delay: float,
         else:
             print(f"  {name}: {len(jobs)} listings, {len(new_rows)} new")
     print(f"\n{total_new} new posting(s).")
-    return all_new
     if all_new:
         print()
         print_rows(all_new)
+    return all_new, failed
 
 
 def cmd_watch(con: sqlite3.Connection, config_path: str, interval: int, delay: float,
                title_filter: list[str] | None = None, csv_path: str | None = None) -> None:
     print(f"watching every {interval}s (re-reads {config_path} each cycle). ctrl-c to stop.")
     sources: list[dict] = []
+    fail_streak: dict[str, int] = {}
     try:
         while True:
             # reload the source list every cycle, so edits apply without a restart
@@ -357,10 +385,24 @@ def cmd_watch(con: sqlite3.Connection, config_path: str, interval: int, delay: f
                 print(f"  ! {config_path} is not valid JSON ({exc}); using last good list",
                       file=sys.stderr)
             print(f"\n[{datetime.now():%Y-%m-%d %H:%M}] {len(sources)} source(s), polling...")
-            new = cmd_run(con, sources, delay, title_filter)
+            new, failed = cmd_run(con, sources, delay, title_filter)
+            log_errors(failed)
             if new and csv_path:  # accumulate: write all unseen so the csv holds the night's finds
                 n = write_csv(unseen(con), csv_path)
                 print(f"  wrote {n} unseen posting(s) to {csv_path}")
+            # count consecutive failures per source; reset any that worked this cycle
+            failed_names = {name for name, _ in failed}
+            for cfg in sources:
+                nm = cfg.get("name", "?")
+                fail_streak[nm] = fail_streak.get(nm, 0) + 1 if nm in failed_names else 0
+            persistent = sorted(
+                ((nm, c) for nm, c in fail_streak.items() if c >= FAIL_ALERT_THRESHOLD),
+                key=lambda x: -x[1],
+            )
+            if persistent:
+                summary = ", ".join(f"{nm} ({c} cycles)" for nm, c in persistent)
+                print(f"  !! persistent failures (>= {FAIL_ALERT_THRESHOLD} cycles): {summary}")
+                print(f"     details in {ERROR_LOG}")
             time.sleep(interval)
     except KeyboardInterrupt:
         print("\nstopped.")
@@ -379,9 +421,13 @@ def cmd_review(con: sqlite3.Connection) -> None:
         _clear_screen()
         print(f"[ {i + 1} / {n} ]\n")
         print(f"  {r['title']}")
-        meta = "  ".join(x for x in (r["company"], r["location"]) if x)
-        if meta:
-            print(f"  {meta}")
+        parts = []
+        if r["company"]:
+            parts.append(f"[{r['company']}]")
+        if r["location"]:
+            parts.append(r["location"])
+        if parts:
+            print(f"  {'   '.join(parts)}")
         if r["url"]:
             print(f"  {r['url']}")
         print("\n  [d]/space = seen (dismiss)   [o]pen   [s]kip   [b]ack   [q]uit")
@@ -634,7 +680,8 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "title", None):
         title_filter = [w.strip().lower() for w in args.title.split(",") if w.strip()]
     if args.cmd == "run":
-        new = cmd_run(con, load_sources(args.config), args.delay, title_filter)
+        new, failed = cmd_run(con, load_sources(args.config), args.delay, title_filter)
+        log_errors(failed)
         if new:  # overwrite: the csv holds just this run's new postings
             n = write_csv(new, args.csv)
             print(f"  wrote {n} new posting(s) to {args.csv}")
