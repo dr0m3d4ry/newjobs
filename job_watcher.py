@@ -109,8 +109,8 @@ def fetch_jobhive(cfg: dict) -> list[Job]:
         rec = _to_dict(j)  # keep everything jobhive returns
         title = _field(rec, "title")
         url = _field(rec, "url", "apply_url")
-        if not title and not url:
-            continue  # skip empty ghost records (no title and no link)
+        if not title:
+            continue  # skip records with no title (junk, even if a base url is present)
         company = _field(rec, "company")
         if not company or "." in company or "/" in company:
             company = cfg["name"]  # feed gave a url/domain (or nothing); use the source name
