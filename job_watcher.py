@@ -212,11 +212,16 @@ def print_rows(rows: list[sqlite3.Row]) -> None:
         if i:
             print()
         print(f"  {r['pk']:>4}  {r['title']}")
-        meta = "  ".join(
-            x for x in (r["company"], r["location"], (r["first_seen"] or "")[:10]) if x
-        )
-        if meta:
-            print(f"        {meta}")
+        parts = []
+        if r["company"]:
+            parts.append(f"[{r['company']}]")
+        if r["location"]:
+            parts.append(r["location"])
+        seen_day = (r["first_seen"] or "")[:10]
+        if seen_day:
+            parts.append(seen_day)
+        if parts:
+            print(f"        {'   '.join(parts)}")
         if r["url"]:
             print(f"        {r['url']}")
 
@@ -375,9 +380,13 @@ def cmd_review(con: sqlite3.Connection) -> None:
         _clear_screen()
         print(f"[ {i + 1} / {n} ]\n")
         print(f"  {r['title']}")
-        meta = "  ".join(x for x in (r["company"], r["location"]) if x)
-        if meta:
-            print(f"  {meta}")
+        parts = []
+        if r["company"]:
+            parts.append(f"[{r['company']}]")
+        if r["location"]:
+            parts.append(r["location"])
+        if parts:
+            print(f"  {'   '.join(parts)}")
         if r["url"]:
             print(f"  {r['url']}")
         print("\n  [d]/space = seen (dismiss)   [o]pen   [s]kip   [b]ack   [q]uit")
