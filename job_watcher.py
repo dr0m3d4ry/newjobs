@@ -38,6 +38,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+ERROR_LOG = "errors.log"
+FAIL_ALERT_THRESHOLD = 3
+
 
 # --------------------------------------------------------------------------- #
 # posting model
@@ -84,10 +87,11 @@ def _to_dict(record: object) -> dict:
 
 def _field(record: object, *names: str) -> str:
     """first non-empty field by name; handles object attrs or dict keys."""
+    is_dict = isinstance(record, dict)
     for n in names:
-        v = getattr(record, n, None)
-        if v is None and isinstance(record, dict):
-            v = record.get(n)
+        # dict lookup first: getattr on a dict would return the method for
+        # names like "items" or "keys"
+        v = record.get(n) if is_dict else getattr(record, n, None)
         if v:
             return str(v)
     return ""
@@ -105,6 +109,8 @@ def fetch_jobhive(cfg: dict) -> list[Job]:
 
     ats, slug = cfg["ats"], cfg["slug"]
     out: list[Job] = []
+    used_ids: set[str] = set()
+    used_sigs: set[tuple[str, str]] = set()
     for j in get_scraper(ats, slug).fetch():
         rec = _to_dict(j)  # keep everything jobhive returns
         title = _field(rec, "title").strip()
@@ -125,6 +131,17 @@ def fetch_jobhive(cfg: dict) -> list[Job]:
             ext = url
         else:
             ext = f"{ats}:{hashlib.sha1(title.encode('utf-8')).hexdigest()}"
+        if (ext, title) in used_sigs:
+            continue  # the exact same posting twice in one fetch
+        used_sigs.add((ext, title))
+        if ext in used_ids:  # different postings sharing an id would drop each other
+            tag = hashlib.sha1(title.encode("utf-8")).hexdigest()[:8]
+            n, cand = 1, f"{ext}#{tag}"
+            while cand in used_ids:
+                n += 1
+                cand = f"{ext}#{tag}-{n}"
+            ext = cand
+        used_ids.add(ext)
         out.append(
             Job(
                 source=cfg["name"],
@@ -211,22 +228,29 @@ def mark_seen(con: sqlite3.Connection, pk: int) -> bool:
 # --------------------------------------------------------------------------- #
 # display
 # --------------------------------------------------------------------------- #
+def _meta_line(row: sqlite3.Row, *, with_date: bool = False) -> str:
+    """bracketed company, location, optional first-seen date."""
+    parts = []
+    if row["company"]:
+        parts.append(f"[{row['company']}]")
+    if row["location"]:
+        parts.append(row["location"])
+    if with_date:
+        day = (row["first_seen"] or "")[:10]
+        if day:
+            parts.append(day)
+    return "   ".join(parts)
+
+
 def print_rows(rows: list[sqlite3.Row]) -> None:
     """one card per job: id + title, meta line, url. blank line between."""
     for i, r in enumerate(rows):
         if i:
             print()
         print(f"  {r['pk']:>4}  {r['title']}")
-        parts = []
-        if r["company"]:
-            parts.append(f"[{r['company']}]")
-        if r["location"]:
-            parts.append(r["location"])
-        seen_day = (r["first_seen"] or "")[:10]
-        if seen_day:
-            parts.append(seen_day)
-        if parts:
-            print(f"        {'   '.join(parts)}")
+        meta = _meta_line(r, with_date=True)
+        if meta:
+            print(f"        {meta}")
         if r["url"]:
             print(f"        {r['url']}")
 
@@ -296,6 +320,55 @@ def _clear_screen() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# filtering
+# --------------------------------------------------------------------------- #
+def _matches(text: str, keywords: list[str]) -> bool:
+    """true if the text contains any keyword (case-insensitive)."""
+    t = text.lower()
+    return any(k in t for k in keywords)
+
+
+def _keywords(value: str | None) -> list[str] | None:
+    """comma-separated string to a lowercased keyword list."""
+    if not value:
+        return None
+    return [w.strip().lower() for w in value.split(",") if w.strip()] or None
+
+
+@dataclass
+class Filters:
+    """title/location keyword filters, applied in the order listed."""
+    title: list[str] | None = None
+    location: list[str] | None = None
+    not_title: list[str] | None = None
+    not_location: list[str] | None = None
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> Filters:
+        return cls(
+            title=_keywords(getattr(args, "title", None)),
+            location=_keywords(getattr(args, "location", None)),
+            not_title=_keywords(getattr(args, "not_title", None)),
+            not_location=_keywords(getattr(args, "not_location", None)),
+        )
+
+    def active(self) -> bool:
+        return any((self.title, self.location, self.not_title, self.not_location))
+
+    def apply(self, jobs: list[Job]) -> list[Job]:
+        kept = jobs
+        if self.title:
+            kept = [j for j in kept if _matches(j.title, self.title)]
+        if self.location:
+            kept = [j for j in kept if _matches(j.location, self.location)]
+        if self.not_title:
+            kept = [j for j in kept if not _matches(j.title, self.not_title)]
+        if self.not_location:
+            kept = [j for j in kept if not _matches(j.location, self.not_location)]
+        return kept
+
+
+# --------------------------------------------------------------------------- #
 # commands
 # --------------------------------------------------------------------------- #
 def load_sources(path: str, *, missing_ok: bool = False) -> list[dict]:
@@ -309,16 +382,6 @@ def load_sources(path: str, *, missing_ok: bool = False) -> list[dict]:
         return json.loads(fp.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         sys.exit(f"{path} is not valid JSON: {exc}")
-
-
-def _match_title(title: str, keywords: list[str]) -> bool:
-    """true if the title contains any keyword (case-insensitive)."""
-    t = title.lower()
-    return any(k in t for k in keywords)
-
-
-ERROR_LOG = "errors.log"
-FAIL_ALERT_THRESHOLD = 3
 
 
 def log_errors(failures: list[tuple[str, str]]) -> None:
@@ -335,7 +398,8 @@ def log_errors(failures: list[tuple[str, str]]) -> None:
 
 
 def cmd_run(con: sqlite3.Connection, sources: list[dict], delay: float,
-            title_filter: list[str] | None = None) -> tuple[list[sqlite3.Row], list[tuple[str, str]]]:
+            filters: Filters | None = None) -> tuple[list[sqlite3.Row], list[tuple[str, str]]]:
+    filters = filters or Filters()
     total_new = 0
     all_new: list[sqlite3.Row] = []
     failed: list[tuple[str, str]] = []
@@ -356,14 +420,11 @@ def cmd_run(con: sqlite3.Connection, sources: list[dict], delay: float,
             print(f"  ! {name}: {reason}", file=sys.stderr)
             failed.append((name, reason))
             continue
-        if title_filter:
-            kept = [j for j in jobs if _match_title(j.title, title_filter)]
-        else:
-            kept = jobs
+        kept = filters.apply(jobs)
         new_rows = upsert_jobs(con, kept)
         all_new.extend(new_rows)
         total_new += len(new_rows)
-        if title_filter:
+        if filters.active():
             print(f"  {name}: {len(jobs)} listings, {len(kept)} match, {len(new_rows)} new")
         else:
             print(f"  {name}: {len(jobs)} listings, {len(new_rows)} new")
@@ -375,7 +436,7 @@ def cmd_run(con: sqlite3.Connection, sources: list[dict], delay: float,
 
 
 def cmd_watch(con: sqlite3.Connection, config_path: str, interval: int, delay: float,
-               title_filter: list[str] | None = None, csv_path: str | None = None) -> None:
+              filters: Filters | None = None, csv_path: str | None = None) -> None:
     print(f"watching every {interval}s (re-reads {config_path} each cycle). ctrl-c to stop.")
     sources: list[dict] = []
     fail_streak: dict[str, int] = {}
@@ -390,16 +451,17 @@ def cmd_watch(con: sqlite3.Connection, config_path: str, interval: int, delay: f
                 print(f"  ! {config_path} is not valid JSON ({exc}); using last good list",
                       file=sys.stderr)
             print(f"\n[{datetime.now():%Y-%m-%d %H:%M}] {len(sources)} source(s), polling...")
-            new, failed = cmd_run(con, sources, delay, title_filter)
+            new, failed = cmd_run(con, sources, delay, filters)
             log_errors(failed)
             if new and csv_path:  # accumulate: write all unseen so the csv holds the night's finds
                 n = write_csv(unseen(con), csv_path)
                 print(f"\n  wrote {n} unseen posting(s) to {csv_path}")
             # count consecutive failures per source; reset any that worked this cycle
             failed_names = {name for name, _ in failed}
-            for cfg in sources:
-                nm = cfg.get("name", "?")
-                fail_streak[nm] = fail_streak.get(nm, 0) + 1 if nm in failed_names else 0
+            fail_streak = {  # rebuild from the current list so removed sources drop out
+                nm: (fail_streak.get(nm, 0) + 1 if nm in failed_names else 0)
+                for nm in (cfg.get("name", "?") for cfg in sources)
+            }
             persistent = sorted(
                 ((nm, c) for nm, c in fail_streak.items() if c >= FAIL_ALERT_THRESHOLD),
                 key=lambda x: -x[1],
@@ -426,13 +488,9 @@ def cmd_review(con: sqlite3.Connection) -> None:
         _clear_screen()
         print(f"[ {i + 1} / {n} ]\n")
         print(f"  {r['title']}")
-        parts = []
-        if r["company"]:
-            parts.append(f"[{r['company']}]")
-        if r["location"]:
-            parts.append(r["location"])
-        if parts:
-            print(f"  {'   '.join(parts)}")
+        meta = _meta_line(r)
+        if meta:
+            print(f"  {meta}")
         if r["url"]:
             print(f"  {r['url']}")
         print("\n  [d]/space = seen (dismiss)   [o]pen   [s]kip   [b]ack   [q]uit")
@@ -460,7 +518,14 @@ def cmd_review(con: sqlite3.Connection) -> None:
 
 def cmd_seen(con: sqlite3.Connection, tokens: list[str]) -> None:
     ids = expand_ids(con, tokens)
-    done = sum(1 for pk in ids if mark_seen(con, pk))
+    done = 0
+    if ids:  # one statement beats one commit per id
+        cur = con.executemany(
+            "UPDATE jobs SET status='seen' WHERE pk=? AND status='new'",
+            [(pk,) for pk in ids],
+        )
+        con.commit()
+        done = cur.rowcount
     msg = f"dismissed {done} posting(s)."
     if done != len(ids):
         msg += f" ({len(ids) - done} not found or already seen)"
@@ -523,7 +588,8 @@ def write_csv(rows: list[sqlite3.Row], out_path: str) -> int:
     import csv
 
     # meta columns first, then every field found in any record's stored data
-    fields = ["source", "status", "first_seen"]
+    meta = ("source", "status", "first_seen")
+    fields = list(meta)
     seen = set(fields)
     records = []
     for r in rows:
@@ -534,9 +600,10 @@ def write_csv(rows: list[sqlite3.Row], out_path: str) -> int:
         if not isinstance(d, dict):
             d = {}
         rec = {"source": r["source"], "status": r["status"], "first_seen": r["first_seen"]}
-        rec.update(d)
+        for k, v in d.items():
+            rec["feed_" + k if k in meta else k] = v  # keep both, meta wins its name
         records.append(rec)
-        for k in d:
+        for k in rec:
             if k not in seen:
                 seen.add(k)
                 fields.append(k)
@@ -613,6 +680,13 @@ def cmd_init(path: str) -> None:
 # --------------------------------------------------------------------------- #
 # cli
 # --------------------------------------------------------------------------- #
+def _add_filter_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--title", help="only keep postings whose title contains any of these (comma-separated)")
+    p.add_argument("--location", help="only keep postings whose location contains any of these (comma-separated)")
+    p.add_argument("--not-title", help="drop postings whose title contains any of these (comma-separated)")
+    p.add_argument("--not-location", help="drop postings whose location contains any of these (comma-separated)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="show job postings you haven't seen yet.")
     p.add_argument("--db", default="jobs.db", help="SQLite file (default: jobs.db)")
@@ -623,13 +697,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     pr = sub.add_parser("run", help="poll all sources once")
     pr.add_argument("--delay", type=float, default=8.0, help="seconds between sources")
-    pr.add_argument("--title", help="only keep postings whose title contains any of these (comma-separated)")
+    _add_filter_args(pr)
     pr.add_argument("--csv", default="jobs_export.csv", help="write this run's new postings to this CSV")
 
     pw = sub.add_parser("watch", help="poll on a loop")
     pw.add_argument("-i", "--interval", type=int, default=3600, help="seconds between polls")
     pw.add_argument("--delay", type=float, default=8.0, help="seconds between sources")
-    pw.add_argument("--title", help="only keep postings whose title contains any of these (comma-separated)")
+    _add_filter_args(pw)
     pw.add_argument("--csv", default="jobs_export.csv", help="accumulate new postings into this CSV each cycle")
 
     sub.add_parser("list", help="show unseen postings")
@@ -681,17 +755,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     con = connect(args.db)
-    title_filter = None
-    if getattr(args, "title", None):
-        title_filter = [w.strip().lower() for w in args.title.split(",") if w.strip()]
+    filters = Filters.from_args(args)
     if args.cmd == "run":
-        new, failed = cmd_run(con, load_sources(args.config), args.delay, title_filter)
+        new, failed = cmd_run(con, load_sources(args.config), args.delay, filters)
         log_errors(failed)
         if new:  # overwrite: the csv holds just this run's new postings
             n = write_csv(new, args.csv)
             print(f"\n  wrote {n} new posting(s) to {args.csv}")
     elif args.cmd == "watch":
-        cmd_watch(con, args.config, args.interval, args.delay, title_filter, args.csv)
+        cmd_watch(con, args.config, args.interval, args.delay, filters, args.csv)
     elif args.cmd == "list":
         print_unseen(unseen(con))
     elif args.cmd == "review":
